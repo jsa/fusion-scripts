@@ -4,13 +4,18 @@
 # sketch.isComputeDeferred = True
 
 from collections import OrderedDict, namedtuple
+import os.path
 import traceback
 
 import adsk
 from adsk import core, fusion
 
 
-ATTR_GROUP = "GenDXF"
+_ATTR_GROUP = "GenDXF"
+
+_TABLE_ID = 'exports-table'
+
+_CELL_ID = '%s-%d'
 
 _app = _ui = None
 
@@ -24,7 +29,7 @@ EXPORT_STATUS = namedtuple(
     (1, 2, 3)
 
 
-class GenDXFExecuteHandler(adsk.core.CommandEventHandler):
+class ExecuteHandler(adsk.core.CommandEventHandler):
     def notify(self, args):
         args = adsk.core.CommandEventArgs.cast(args)
         inputs = args.command.commandInputs
@@ -32,57 +37,80 @@ class GenDXFExecuteHandler(adsk.core.CommandEventHandler):
         # sketches = rootComp.sketches
         # sketch = sketches.add()
 
-        if inputs.itemById('equilateral').value is True:
-            _ui.messageBox("equilateral")
+        d = _ui.createFileDialog()
+        d.isMultiSelectEnabled = False
+        d.title = "Select output directory"
+        d.filter = "Drawing Exchange Format (*.dxf)"
+        d.filterIndex = 0
+        rs = d.showSave()
+        if rs == adsk.core.DialogResults.DialogOK:
+            filename = d.filename
         else:
-            _ui.messageBox("not equilateral")
+            return
+
+        # yeah fuck "not overwriting built-ins" when they're stupid...
+        dir = filename.rsplit(os.path.sep, 1)[0]
+
+        table = inputs.itemById(_TABLE_ID)
+
+        for row in range(1, table.rowCount):
+            def input(_id):
+                return inputs.itemById(_CELL_ID % (_id, row)).value
+
+            temp_id, basename = map(input, ('temp-id', 'basename'))
+
+            filename = input('filename') + input('ext')
+            _ui.messageBox("Generating %s%s%s" % (dir, os.path.sep, filename))
+
+        # if inputs.itemById('equilateral').value is True:
+        #     _ui.messageBox("equilateral")
+        # else:
+        #     _ui.messageBox("not equilateral")
 
         adsk.terminate()
 
 
-class GenDXFCancelHandler(adsk.core.CommandEventHandler):
+class CancelHandler(adsk.core.CommandEventHandler):
     def notify(self, args):
         adsk.terminate()
 
 
-class GenDXFEventHandler(adsk.core.CommandCreatedEventHandler):
+class ExportDialogHandler(adsk.core.CommandCreatedEventHandler):
     def notify(self, args):
-        app = adsk.core.Application.get()
         args = adsk.core.CommandCreatedEventArgs.cast(args)
         cmd = args.command
 
         try:
-            ok = mkExportDialog(app, cmd)
+            ok = mk_export_dialog(_app, cmd)
         except:
-            app.userInterface.messageBox("Error:\n%s" % (traceback.format_exc(),))
-            adsk.terminate()
-            return False
+            _ui.messageBox("Error:\n%s" % (traceback.format_exc(),))
+            ok = False
 
         if not ok:
             adsk.terminate()
             return False
 
-        exe = GenDXFExecuteHandler()
+        exe = ExecuteHandler()
         cmd.execute.add(exe)
         handlers.append(exe)
 
-        cancel = GenDXFCancelHandler()
+        cancel = CancelHandler()
         cmd.destroy.add(cancel)
         handlers.append(cancel)
 
 
 class ExportsTable(adsk.core.InputChangedEventHandler):
-    def __init__(self, inputs, tableId, selectionInputId):
+    def __init__(self, inputs, selectionInputId):
         super(ExportsTable, self).__init__()
         self.inputs = inputs
         self.selectionInputId = selectionInputId
         self.exports = [] # type: list[FaceExport]
-        self.table = self._mk_table(tableId) # type: core.TableCommandInput
+        self.table = self._mk_table() # type: core.TableCommandInput
         self._render_table()
 
-    def _mk_table(self, tableId):
+    def _mk_table(self):
         table = self.inputs.addTableCommandInput(
-            tableId, "Output files", 4, "1:3:1:1")
+            _TABLE_ID, "Output files", 4, "1:3:1:1")
         table.minimumVisibleRows = 3
         table.maximumVisibleRows = 8
         table.tablePresentationStyle = \
@@ -109,57 +137,83 @@ class ExportsTable(adsk.core.InputChangedEventHandler):
                 filename = "%s (%d)" % (export.basename, n)
             seen_filenames.add(filename)
 
-            # TODO include tempId
+            # a couple hidden inputs
+            for _id, value in (('basename', export.basename),
+                               ('temp-id', str(export.tempId))):
+                i = self.inputs.addStringValueInput(
+                    _CELL_ID % (_id, row), "", value)
+                i.isReadOnly = True
+                i.isVisible = False
 
-            i = self.inputs.addBoolValueInput('include-%d' % row, "", True)
-            i.value = True
-            assert self.table.addCommandInput(i, row, 0, 0, 0)
-            i = self.inputs.addStringValueInput('filename-%d' % row, "", filename)
+            if export.status != EXPORT_STATUS.TENTATIVE:
+                i = self.inputs.addBoolValueInput(_CELL_ID % ('include', row), "", True)
+                i.tooltip = "Whether to include the face in this export job"
+                if export.status == EXPORT_STATUS.SELECTED:
+                    i.value = True
+                assert self.table.addCommandInput(i, row, 0, 0, 0)
+
+            i = self.inputs.addStringValueInput(_CELL_ID % ('filename', row), "", filename)
             assert self.table.addCommandInput(i, row, 1, 0, 0)
-            i = self.inputs.addStringValueInput('ext-%d' % row, "", ".dxf")
+            i = self.inputs.addStringValueInput(_CELL_ID % ('ext', row), "", ".dxf")
             i.isReadOnly = True
             assert self.table.addCommandInput(i, row, 2, 0, 0)
-            i = self.inputs.addBoolValueInput('del-%d' % row, "Delete", False)
+
+            i = self.inputs.addBoolValueInput(_CELL_ID % ('remove', row), "Remove", False)
+            i.tooltip = "Remove the face from this list"
             assert self.table.addCommandInput(i, row, 3, 0, 0)
 
     def notify(self, args):
         args = adsk.core.InputChangedEventArgs.cast(args)
+        # sample code:
+        # inputs = args.firingEvent.sender.commandInputs
+        # scaleInput = inputs.itemById('heightScale')
         if args.input.id == self.selectionInputId:
             select = args.input # type: core.SelectionCommandInput
+            try:
+                self._update_selected(select)
+            except:
+                _ui.messageBox("Failed:\n%s" % (traceback.format_exc(),))
+        elif args.input.id == self.table.id:
+            TODO
 
-            selected = {}
-            for i in range(select.selectionCount):
-                face = select.selection(i).entity # type: fusion.BRepFace
-                selected[face.tempId] = face
+    def _update_selected(self, select):
+        selected = {}
+        for i in range(select.selectionCount):
+            face = select.selection(i).entity # type: fusion.BRepFace
+            selected[face.tempId] = face
 
-            prune = set()
-            for export in self.exports:
-                try:
-                    selected.pop(export.tempId)
-                except KeyError:
-                    if export.status == EXPORT_STATUS.SELECTED:
-                        export.status = EXPORT_STATUS.UNSELECTED
-                    elif export.status == EXPORT_STATUS.TENTATIVE:
-                        prune.add(export.tempId)
+        prune = set()
+        for export in self.exports:
+            try:
+                selected.pop(export.tempId)
+            except KeyError:
+                if export.status == EXPORT_STATUS.SELECTED:
+                    export.status = EXPORT_STATUS.UNSELECTED
+                elif export.status == EXPORT_STATUS.TENTATIVE:
+                    prune.add(export.tempId)
+            else:
+                if export.status == EXPORT_STATUS.UNSELECTED:
+                    export.status = EXPORT_STATUS.SELECTED
 
-            # delete tentative
-            self.exports = [e for e in self.exports if e.tempId not in prune]
+        # delete tentative
+        self.exports = [e for e in self.exports if e.tempId not in prune]
 
-            # register all the rest (they're new)
-            for face in selected.values():
-                # these weren't in exports, must be tentative
-                assert not face.attributes.itemByName(ATTR_GROUP, 'basename')
-                self.exports.append(FaceExport(
-                    face, face.tempId, face.body.name, EXPORT_STATUS.TENTATIVE))
+        # register all the rest (they're new)
+        for face in selected.values():
+            a = face.attributes.itemByName(_ATTR_GROUP, 'basename')
+            if a:
+                basename = a.value
+                status = EXPORT_STATUS.SELECTED
+            else:
+                basename = face.body.name
+                status = EXPORT_STATUS.TENTATIVE
+            self.exports.append(FaceExport(
+                face, face.tempId, basename, status))
 
-            self._render_table()
-
-            # sample code:
-            # inputs = args.firingEvent.sender.commandInputs
-            # scaleInput = inputs.itemById('heightScale')
+        self._render_table()
 
 
-def mkExportDialog(app, cmd):
+def mk_export_dialog(app, cmd):
     # if app.activeEditObject.objectType != adsk.fusion.Sketch.classType():
     #     ui.messageBox('A sketch must be active for this command.')
     #     return False
@@ -169,26 +223,27 @@ def mkExportDialog(app, cmd):
     if not design:
         raise Exception("No active Fusion design")
 
-    cmd.okButtonText = "Export"
+    cmd.okButtonText = "Export..."
     inputs = cmd.commandInputs
 
+    select_id = 'select-exports'
     select = inputs.addSelectionInput(
-        'select-exports', "Exports:", "Select faces to export")
+        select_id, "Exports:", "Select faces to export")
     select.addSelectionFilter('PlanarFaces')
     select.setSelectionLimits(0, 0)
 
-    exportsTable = ExportsTable(inputs, 'export-list', 'select-exports')
+    exportsTable = ExportsTable(inputs, select_id)
     cmd.inputChanged.add(exportsTable)
     handlers.append(exportsTable)
 
     bodies = design.rootComponent.bRepBodies
     for i in range(bodies.count):
         body = bodies.item(i)
-        if body.attributes.itemByName(ATTR_GROUP, 'export'):
+        if body.attributes.itemByName(_ATTR_GROUP, 'export'):
             faces = body.faces
             for j in range(faces.count):
                 face = faces.item(j)
-                if face.attributes.itemByName(ATTR_GROUP, 'basename'):
+                if face.attributes.itemByName(_ATTR_GROUP, 'basename'):
                     select.addSelection(face)
 
     return True
@@ -208,7 +263,7 @@ def run(context):
 
         btn = cmdDefs.addButtonDefinition('gen-dxf-button', "Generate DXF", "")
 
-        h = GenDXFEventHandler()
+        h = ExportDialogHandler()
         btn.commandCreated.add(h)
         handlers.append(h)
 
