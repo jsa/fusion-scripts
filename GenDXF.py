@@ -98,6 +98,7 @@ def mk_export_dialog(cmd, root, prog):
 
     for face in faces:
         assert select.addSelection(face)
+
     table._update_selected(select)
 
     return True
@@ -108,9 +109,10 @@ def scan_faces(root, prog):
 
     export = []
     for i in range(bodies.count):
-        body = bodies.item(i)
+        body = bodies.item(i) # type: fusion.BRepBody
         if body.attributes.itemByName(_ATTR_GROUP, 'export'):
             export.append(body)
+            # body.attributes.itemByName(_ATTR_GROUP, 'export').deleteMe()
 
     if not export:
         return []
@@ -131,6 +133,7 @@ def scan_faces(root, prog):
                 # didn't work:
                 # yield face
                 rs.append(face)
+                # face.attributes.itemByName(_ATTR_GROUP, 'basename').deleteMe()
             prog_n += 1
             prog.progressValue = prog_n
 
@@ -166,6 +169,7 @@ class ExportsTable(adsk.core.InputChangedEventHandler):
         return table
 
     def _render_table(self):
+        self.table.selectedRow = -1
         self.table.clear()
 
         # header row
@@ -202,14 +206,15 @@ class ExportsTable(adsk.core.InputChangedEventHandler):
                     i.isReadOnly = True
                     i.isVisible = False
 
+            _id = cell('include')
+            i = self.inputs.itemById(_id)
+            if not i:
+                i = self.inputs.addBoolValueInput(_id, "", True)
+                i.tooltip = "Whether to include the face in this export job"
+            # signal execution to include also tentative in export ...
+            i.value = export.status != FaceExport.UNSELECTED
+            # ... but leave it out from the table
             if export.status != FaceExport.TENTATIVE:
-                _id = cell('include')
-                i = self.inputs.itemById(_id)
-                if not i:
-                    i = self.inputs.addBoolValueInput(_id, "", True)
-                    i.tooltip = "Whether to include the face in this export job"
-                if export.status == FaceExport.SELECTED:
-                    i.value = True
                 assert self.table.addCommandInput(i, row, 0, 0, 0)
 
             _id = cell('filename')
@@ -255,10 +260,10 @@ class ExportsTable(adsk.core.InputChangedEventHandler):
                 row = int(row)
                 inputs = args.firingEvent.sender.commandInputs
                 face_id = inputs.itemById(_CELL_ID % ('face-id', row)).value
+                body_name, temp_id = split_face_id(face_id)
                 self.exports = list(filter(
                     lambda e: e.face_id != face_id, self.exports))
 
-                body_name, temp_id = split_face_id(face_id)
                 select = inputs.itemById(self.selectionInputId) # type: core.SelectionCommandInput
                 selections = [
                     select.selection(i).entity
@@ -268,7 +273,19 @@ class ExportsTable(adsk.core.InputChangedEventHandler):
                 for face in selections:
                     if (face.body.name, face.tempId) != (body_name, temp_id):
                         assert select.addSelection(face)
+
+                # self._render_table()
                 # self._update_selected(select)
+
+                """
+                def defer():
+                    import time
+                    time.sleep(5)
+                    self._render_table()
+
+                t = threading.Thread(target=defer)
+                t.start()
+                """
 
     def _update_selected(self, select):
         selected = {}
@@ -300,7 +317,7 @@ class ExportsTable(adsk.core.InputChangedEventHandler):
                 basename = a.value
                 status = FaceExport.SELECTED
             else:
-                basename = face.body.name
+                basename = face.body.name.replace(os.path.sep, "_")
                 status = FaceExport.TENTATIVE
             self.exports.append(FaceExport(face_id(face), basename, status))
 
@@ -313,6 +330,12 @@ class ExecuteHandler(adsk.core.CommandEventHandler):
         self.root = root # type: fusion.Component
 
     def notify(self, args):
+        try:
+            self._notify(args)
+        except:
+            _ui.messageBox("Error:\n%s" % (traceback.format_exc(),))
+
+    def _notify(self, args):
         args = adsk.core.CommandEventArgs.cast(args)
         inputs = args.command.commandInputs
         table = inputs.itemById(_TABLE_ID)
@@ -336,9 +359,10 @@ class ExecuteHandler(adsk.core.CommandEventHandler):
         else:
             dir = None
 
+        _bodies = self.root.bRepBodies
         bodies = {}
-        for i in range(bodies.count):
-            body = bodies.item(i)
+        for i in range(_bodies.count):
+            body = _bodies.item(i)
             bodies[body.name] = body
 
         for row in range(1, table.rowCount):
