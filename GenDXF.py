@@ -215,7 +215,10 @@ class ExportsTable(adsk.core.InputChangedEventHandler):
             i.value = export.status != FaceExport.UNSELECTED
             # ... but leave it out from the table
             if export.status != FaceExport.TENTATIVE:
+                i.isVisible = True
                 assert self.table.addCommandInput(i, row, 0, 0, 0)
+            else:
+                i.isVisible = False
 
             _id = cell('filename')
             i = self.inputs.itemById(_id)
@@ -256,6 +259,7 @@ class ExportsTable(adsk.core.InputChangedEventHandler):
 
         elif "-" in args.input.id:
             field, row = args.input.id.rsplit("-", 1)
+
             if field == "remove":
                 row = int(row)
                 inputs = args.firingEvent.sender.commandInputs
@@ -273,19 +277,9 @@ class ExportsTable(adsk.core.InputChangedEventHandler):
                 for face in selections:
                     if (face.body.name, face.tempId) != (body_name, temp_id):
                         assert select.addSelection(face)
-
-                # self._render_table()
-                # self._update_selected(select)
-
-                """
-                def defer():
-                    import time
-                    time.sleep(5)
-                    self._render_table()
-
-                t = threading.Thread(target=defer)
+                self.table.selectedRow = -1
+                t = threading.Thread(target=del_row, args=[inputs, args.input.id])
                 t.start()
-                """
 
     def _update_selected(self, select):
         selected = {}
@@ -322,6 +316,16 @@ class ExportsTable(adsk.core.InputChangedEventHandler):
             self.exports.append(FaceExport(face_id(face), basename, status))
 
         self._render_table()
+
+
+def del_row(inputs, input_id):
+    import time
+    time.sleep(.1)
+    table = inputs.itemById(_TABLE_ID) # type: core.TableCommandInput
+    for row in range(1, table.rowCount):
+        if table.getInputAtPosition(row, 3).id == input_id:
+            table.deleteRow(row)
+            break
 
 
 class ExecuteHandler(adsk.core.CommandEventHandler):
@@ -398,7 +402,6 @@ def run(context):
     global _app, _ui
     try:
         _app = adsk.core.Application.get()
-
         _ui = _app.userInterface
         cmdDefs = _ui.commandDefinitions
 
@@ -407,7 +410,6 @@ def run(context):
             btn.deleteMe()
 
         btn = cmdDefs.addButtonDefinition('gen-dxf-button', "Generate DXF", "")
-
         h = ExportDialogHandler()
         btn.commandCreated.add(h)
         handlers.append(h)
@@ -418,21 +420,6 @@ def run(context):
         # buttonControl = panel.controls.addCommand(btn)
 
         adsk.autoTerminate(False)
-
-        # sel = ui.selectEntity("Select faces to export", "PlanarFaces")
-        # ent = sel.entity
-        # ui.messageBox(
-        #     "%r: %r\n\ngroupNames: %r"
-        #     % (type(ent),
-        #        ent,
-        #        ent.attributes.groupNames),
-        #     "Entity info")
-
-        # geom = ent.geometry
-        # ui.messageBox("%r: %r" % (type(geom), geom), "Entity geometry info")
-
-        # if isinstance(ent.geometry, core.Plane):
-        #     ent.attributes.add("GenDXF", "filename", "foo-bar")
 
     except:
         if _ui:
