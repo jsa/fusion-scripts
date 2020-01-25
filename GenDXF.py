@@ -21,7 +21,7 @@ _app = _ui = None
 
 handlers = []
 
-FaceExport = namedtuple('FaceExport', ('face', 'tempId', 'basename', 'status'))
+FaceExport = namedtuple('FaceExport', ('face', 'face_id', 'basename', 'status'))
 
 EXPORT_STATUS = namedtuple(
     'ExportStatus',
@@ -29,74 +29,106 @@ EXPORT_STATUS = namedtuple(
     (1, 2, 3)
 
 
-class ExecuteHandler(adsk.core.CommandEventHandler):
-    def notify(self, args):
-        args = adsk.core.CommandEventArgs.cast(args)
-        inputs = args.command.commandInputs
-
-        # sketches = rootComp.sketches
-        # sketch = sketches.add()
-
-        d = _ui.createFileDialog()
-        d.isMultiSelectEnabled = False
-        d.title = "Select output directory"
-        d.filter = "Drawing Exchange Format (*.dxf)"
-        d.filterIndex = 0
-        rs = d.showSave()
-        if rs == adsk.core.DialogResults.DialogOK:
-            filename = d.filename
-        else:
-            return
-
-        # yeah fuck "not overwriting built-ins" when they're stupid...
-        dir = filename.rsplit(os.path.sep, 1)[0]
-
-        table = inputs.itemById(_TABLE_ID)
-
-        for row in range(1, table.rowCount):
-            def input(_id):
-                return inputs.itemById(_CELL_ID % (_id, row)).value
-
-            temp_id, basename = map(input, ('temp-id', 'basename'))
-
-            filename = input('filename') + input('ext')
-            _ui.messageBox("Generating %s%s%s" % (dir, os.path.sep, filename))
-
-        # if inputs.itemById('equilateral').value is True:
-        #     _ui.messageBox("equilateral")
-        # else:
-        #     _ui.messageBox("not equilateral")
-
-        adsk.terminate()
-
-
-class CancelHandler(adsk.core.CommandEventHandler):
-    def notify(self, args):
-        adsk.terminate()
-
-
 class ExportDialogHandler(adsk.core.CommandCreatedEventHandler):
     def notify(self, args):
+        design = adsk.fusion.Design.cast(_app.activeProduct)
+        if not design:
+            raise Exception("No active Fusion design")
+        root = design.rootComponent
+
         args = adsk.core.CommandCreatedEventArgs.cast(args)
         cmd = args.command
 
+        prog = _ui.createProgressDialog()
+        prog.isCancelButtonShown = True
+
         try:
-            ok = mk_export_dialog(_app, cmd)
+            ok = mk_export_dialog(cmd, root, prog)
         except:
             _ui.messageBox("Error:\n%s" % (traceback.format_exc(),))
             ok = False
 
         if not ok:
+            # causes a crash:
+            # cmd.doExecute(True)
             adsk.terminate()
-            return False
+            return
 
-        exe = ExecuteHandler()
+        exe = ExecuteHandler(root)
         cmd.execute.add(exe)
         handlers.append(exe)
 
         cancel = CancelHandler()
         cmd.destroy.add(cancel)
         handlers.append(cancel)
+
+
+def mk_export_dialog(cmd, root, prog):
+    faces = scan_faces(root, prog)
+    if prog.wasCancelled:
+        return False
+
+    cmd.okButtonText = "Export..."
+    inputs = cmd.commandInputs
+
+    select_id = 'select-exports'
+    select = inputs.addSelectionInput(
+        select_id, "Exports:", "Select faces to export")
+    select.addSelectionFilter('PlanarFaces')
+    select.setSelectionLimits(0, 0)
+
+    exportsTable = ExportsTable(inputs, select_id)
+    cmd.inputChanged.add(exportsTable)
+    handlers.append(exportsTable)
+
+    for face in faces:
+        select.addSelection(face)
+
+    return True
+
+
+def scan_faces(root, prog):
+    bodies = root.bRepBodies
+
+    export = []
+    for i in range(bodies.count):
+        body = bodies.item(i)
+        if body.attributes.itemByName(_ATTR_GROUP, 'export'):
+            export.append(body)
+
+    if not export:
+        return []
+
+    face_count = sum(body.faces.count for body in export)
+    prog.show("Scanning faces...", "%v/%m (%p%) complete", 0, face_count, 1)
+
+    prog_n, rs = 0, []
+    for body in export:
+        if prog.wasCancelled:
+            break
+        faces = body.faces
+        for j in range(faces.count):
+            if prog.wasCancelled:
+                break
+            face = faces.item(j)
+            if face.attributes.itemByName(_ATTR_GROUP, 'basename'):
+                # didn't work:
+                # yield face
+                rs.append(face)
+            prog_n += 1
+            prog.progressValue = prog_n
+
+    prog.hide()
+    return rs
+
+
+def face_id(face):
+    return "%s/%d" % (face.body.name, face.tempId)
+
+
+def split_face_id(face_id):
+    body_name, temp_id = face_id.rsplit("/", 1)
+    return body_name, int(temp_id)
 
 
 class ExportsTable(adsk.core.InputChangedEventHandler):
@@ -139,7 +171,7 @@ class ExportsTable(adsk.core.InputChangedEventHandler):
 
             # a couple hidden inputs
             for _id, value in (('basename', export.basename),
-                               ('temp-id', str(export.tempId))):
+                               ('face-id', export.face_id)):
                 i = self.inputs.addStringValueInput(
                     _CELL_ID % (_id, row), "", value)
                 i.isReadOnly = True
@@ -180,23 +212,23 @@ class ExportsTable(adsk.core.InputChangedEventHandler):
         selected = {}
         for i in range(select.selectionCount):
             face = select.selection(i).entity # type: fusion.BRepFace
-            selected[face.tempId] = face
+            selected[face_id(face)] = face
 
         prune = set()
         for export in self.exports:
             try:
-                selected.pop(export.tempId)
+                selected.pop(export.face_id)
             except KeyError:
                 if export.status == EXPORT_STATUS.SELECTED:
                     export.status = EXPORT_STATUS.UNSELECTED
                 elif export.status == EXPORT_STATUS.TENTATIVE:
-                    prune.add(export.tempId)
+                    prune.add(export.face_id)
             else:
                 if export.status == EXPORT_STATUS.UNSELECTED:
                     export.status = EXPORT_STATUS.SELECTED
 
         # delete tentative
-        self.exports = [e for e in self.exports if e.tempId not in prune]
+        self.exports = [e for e in self.exports if e.face_id not in prune]
 
         # register all the rest (they're new)
         for face in selected.values():
@@ -208,53 +240,72 @@ class ExportsTable(adsk.core.InputChangedEventHandler):
                 basename = face.body.name
                 status = EXPORT_STATUS.TENTATIVE
             self.exports.append(FaceExport(
-                face, face.tempId, basename, status))
+                face, face_id(face), basename, status))
 
         self._render_table()
 
 
-def mk_export_dialog(app, cmd):
-    # if app.activeEditObject.objectType != adsk.fusion.Sketch.classType():
-    #     ui.messageBox('A sketch must be active for this command.')
-    #     return False
+class ExecuteHandler(adsk.core.CommandEventHandler):
+    def __init__(self, root):
+        super(ExecuteHandler, self).__init__()
+        self.root = root # type: fusion.Component
 
-    product = app.activeProduct
-    design = adsk.fusion.Design.cast(product)
-    if not design:
-        raise Exception("No active Fusion design")
+    def notify(self, args):
+        args = adsk.core.CommandEventArgs.cast(args)
+        inputs = args.command.commandInputs
 
-    cmd.okButtonText = "Export..."
-    inputs = cmd.commandInputs
+        # sketches = rootComp.sketches
+        # sketch = sketches.add()
 
-    select_id = 'select-exports'
-    select = inputs.addSelectionInput(
-        select_id, "Exports:", "Select faces to export")
-    select.addSelectionFilter('PlanarFaces')
-    select.setSelectionLimits(0, 0)
+        d = _ui.createFileDialog()
+        d.isMultiSelectEnabled = False
+        d.title = "Select output directory"
+        d.filter = "Drawing Exchange Format (*.dxf)"
+        d.filterIndex = 0
+        rs = d.showSave()
+        if rs == adsk.core.DialogResults.DialogOK:
+            filename = d.filename
+        else:
+            return
 
-    exportsTable = ExportsTable(inputs, select_id)
-    cmd.inputChanged.add(exportsTable)
-    handlers.append(exportsTable)
+        # yeah fuck "not overwriting built-ins" when they're stupid...
+        dir = filename.rsplit(os.path.sep, 1)[0]
 
-    bodies = design.rootComponent.bRepBodies
-    for i in range(bodies.count):
-        body = bodies.item(i)
-        if body.attributes.itemByName(_ATTR_GROUP, 'export'):
-            faces = body.faces
-            for j in range(faces.count):
-                face = faces.item(j)
-                if face.attributes.itemByName(_ATTR_GROUP, 'basename'):
-                    select.addSelection(face)
+        table = inputs.itemById(_TABLE_ID)
+        bodies = self.root.bRepBodies
 
-    return True
+        for row in range(1, table.rowCount):
+            def input(_id):
+                return inputs.itemById(_CELL_ID % (_id, row)).value
+
+            face_id, basename = map(input, ('face-id', 'basename'))
+            body_name, temp_id = split_face_id(face_id)
+            for i in range(bodies.count):
+                body = bodies.item(i)
+                if body.name == body_name:
+                    faces = body.findByTempId(temp_id)
+                    assert len(faces) == 1, "face tempId collision"
+                    face = faces[0]
+                    face.attributes.add(_ATTR_GROUP, 'basename', basename)
+                    body.attributes.add(_ATTR_GROUP, 'export', 'yes')
+
+            filename = input('filename') + input('ext')
+            _ui.messageBox("Generating %s%s%s" % (dir, os.path.sep, filename))
+
+        adsk.terminate()
+
+
+class CancelHandler(adsk.core.CommandEventHandler):
+    def notify(self, args):
+        adsk.terminate()
 
 
 def run(context):
     global _app, _ui
     try:
         _app = adsk.core.Application.get()
-        _ui = _app.userInterface
 
+        _ui = _app.userInterface
         cmdDefs = _ui.commandDefinitions
 
         btn = cmdDefs.itemById('gen-dxf-button')
