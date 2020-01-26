@@ -348,11 +348,16 @@ class ExecuteHandler(adsk.core.CommandEventHandler):
             _ui.messageBox("Error:\n%s" % (traceback.format_exc(),), "Error")
 
     def _notify(self, args):
+        design = adsk.fusion.Design.cast(_app.activeProduct)
+        if not design:
+            raise Exception("No active Fusion design")
+        root = design.rootComponent
+
         args = adsk.core.CommandEventArgs.cast(args)
         inputs = args.command.commandInputs
         table = inputs.itemById(_TABLE_ID) # type: core.TableCommandInput
 
-        if any(table.getInputAtPosition(row, COL.INCLUDE).valu
+        if any(table.getInputAtPosition(row, COL.INCLUDE).value
                for row in range(1, table.rowCount)):
             d = _ui.createFileDialog()
             d.isMultiSelectEnabled = False
@@ -378,6 +383,12 @@ class ExecuteHandler(adsk.core.CommandEventHandler):
             bodies[body.name] = body
 
         keep = set()
+        prog = _ui.createProgressDialog()
+        prog.show("Generating DXF files...",
+                  "%v/%m (%p%) complete",
+                  0,
+                  table.rowCount - 1,
+                  0)
 
         for row in range(1, table.rowCount):
             face_id = table.getInputAtPosition(row, COL.FACE_ID).value
@@ -390,13 +401,16 @@ class ExecuteHandler(adsk.core.CommandEventHandler):
             filename = table.getInputAtPosition(row, COL.FILENAME).value
             # export first, to inhibit permanent export flag on failure
             if table.getInputAtPosition(row, COL.INCLUDE).value:
-                out = filename + table.getInputAtPosition(row, COL.EXT).value
-                _ui.messageBox("Generating %s%s%s" % (dir, os.path.sep, out))
-                # sketches = rootComp.sketches
-                # sketch = sketches.add()
+                path = dir + os.path.sep \
+                       + filename + table.getInputAtPosition(row, COL.EXT).value
+                sketch = root.sketches.add(face)
+                sketch.saveAsDXF(path)
+                sketch.deleteMe()
 
             face.attributes.add(_ATTR_GROUP, 'filename', filename)
             body.attributes.add(_ATTR_GROUP, 'export', "yes")
+
+            prog.progressValue = row
 
         for face in _scan_cache:
             if (face.body.name, face.tempId) not in keep:
@@ -411,6 +425,7 @@ class ExecuteHandler(adsk.core.CommandEventHandler):
                 if a:
                     a.deleteMe()
 
+        prog.hide()
         adsk.terminate()
 
 
