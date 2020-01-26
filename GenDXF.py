@@ -3,7 +3,9 @@
 # pro tip:
 # sketch.isComputeDeferred = True
 
+from collections import namedtuple
 import os.path
+import re
 import threading
 import traceback
 
@@ -15,13 +17,24 @@ _ATTR_GROUP = "GenDXF"
 
 _TABLE_ID = 'exports-table'
 
-_CELL_ID = '%s-%d'
-
 _app = None # type: core.Application
-
 _ui = None # type: core.UserInterface
-
 handlers = []
+_scan_cache = [] # type: list[fusion.BRepFace]
+
+COL = namedtuple(
+    "ColumnOrder",
+    ('FACE_ID', 'INCLUDE', 'FILENAME', 'EXT', 'REMOVE')) \
+    (0, 1, 2, 3, 4)
+
+
+# characters that aren't allowed in input IDs
+_non_id = re.compile(r"[^a-zA-Z0-9\-]")
+
+def _input_id(field, face_id):
+    # spaces are allowed, per se, but keepin' it real
+    return _non_id.sub("_", "%s-%s" % (field, face_id)) \
+                  .replace(" ", "-")
 
 
 class FaceExport(object):
@@ -29,9 +42,9 @@ class FaceExport(object):
     SELECTED = 2
     UNSELECTED = 3
 
-    def __init__(self, face_id, basename, status):
+    def __init__(self, face_id, filename, status):
         self.face_id = face_id
-        self.basename = basename
+        self.filename = filename
         self.status = status
 
     def get_status(self):
@@ -60,7 +73,7 @@ class ExportDialogHandler(adsk.core.CommandCreatedEventHandler):
         try:
             ok = mk_export_dialog(cmd, root, prog)
         except:
-            _ui.messageBox("Error:\n%s" % (traceback.format_exc(),))
+            _ui.messageBox("Error:\n%s" % (traceback.format_exc(),), "Error")
             ok = False
 
         if not ok:
@@ -105,6 +118,8 @@ def mk_export_dialog(cmd, root, prog):
 
 
 def scan_faces(root, prog):
+    global _scan_cache
+
     bodies = root.bRepBodies
 
     export = []
@@ -129,15 +144,16 @@ def scan_faces(root, prog):
             if prog.wasCancelled:
                 break
             face = faces.item(j)
-            if face.attributes.itemByName(_ATTR_GROUP, 'basename'):
+            if face.attributes.itemByName(_ATTR_GROUP, 'filename'):
                 # didn't work:
                 # yield face
                 rs.append(face)
-                # face.attributes.itemByName(_ATTR_GROUP, 'basename').deleteMe()
+                # face.attributes.itemByName(_ATTR_GROUP, 'filename').deleteMe()
             prog_n += 1
             prog.progressValue = prog_n
 
     prog.hide()
+    _scan_cache = rs
     return rs
 
 
@@ -157,98 +173,22 @@ class ExportsTable(adsk.core.InputChangedEventHandler):
         self.selectionInputId = selectionInputId
         self.exports = [] # type: list[FaceExport]
         self.table = self._mk_table() # type: core.TableCommandInput
-        self._render_table()
+        _render_table(self.inputs, self.exports)
 
     def _mk_table(self):
         table = self.inputs.addTableCommandInput(
-            _TABLE_ID, "Output files", 4, "1:3:1:1")
+            _TABLE_ID, "Output files", 4, "0:1:3:1:1")
         table.minimumVisibleRows = 3
         table.maximumVisibleRows = 8
         table.tablePresentationStyle = \
             adsk.core.TablePresentationStyles.itemBorderTablePresentationStyle
         return table
 
-    def _render_table(self):
-        self.table.selectedRow = -1
-        self.table.clear()
-
-        # header row
-        i = self.inputs.itemById('th1') \
-            or self.inputs.addStringValueInput('h1', "", "Enable")
-        i.isReadOnly = True
-        assert self.table.addCommandInput(i, 0, 0, 0, 0)
-
-        i = self.inputs.itemById('th2') \
-            or self.inputs.addStringValueInput('h2', "", "Filename")
-        i.isReadOnly = True
-        assert self.table.addCommandInput(i, 0, 1, 0, 1)
-
-        # the actual export file list
-        seen_filenames = set()
-        for row, export in enumerate(self.exports, start=1):
-            cell = lambda field: _CELL_ID % (field, row)
-
-            filename, n = export.basename, 1
-            while filename in seen_filenames:
-                n += 1
-                filename = "%s (%d)" % (export.basename, n)
-            seen_filenames.add(filename)
-
-            # a couple hidden inputs
-            for field, value in (('basename', export.basename),
-                                 ('face-id', export.face_id)):
-                _id = cell(field)
-                i = self.inputs.itemById(_id)
-                if i:
-                    i.value = value
-                else:
-                    i = self.inputs.addStringValueInput(_id, "", value)
-                    i.isReadOnly = True
-                    i.isVisible = False
-
-            _id = cell('include')
-            i = self.inputs.itemById(_id)
-            if not i:
-                i = self.inputs.addBoolValueInput(_id, "", True)
-                i.tooltip = "Whether to include the face in this export job"
-            # signal execution to include also tentative in export ...
-            i.value = export.status != FaceExport.UNSELECTED
-            # ... but leave it out from the table
-            if export.status != FaceExport.TENTATIVE:
-                i.isVisible = True
-                assert self.table.addCommandInput(i, row, 0, 0, 0)
-            else:
-                i.isVisible = False
-
-            _id = cell('filename')
-            i = self.inputs.itemById(_id)
-            if i:
-                i.value = filename
-            else:
-                i = self.inputs.addStringValueInput(_id, "", filename)
-            assert self.table.addCommandInput(i, row, 1, 0, 0)
-
-            _id = cell('ext')
-            i = self.inputs.itemById(_id)
-            if i:
-                i.value = filename
-            else:
-                i = self.inputs.addStringValueInput(_id, "", ".dxf")
-                i.isReadOnly = True
-            assert self.table.addCommandInput(i, row, 2, 0, 0)
-
-            _id = cell('remove')
-            i = self.inputs.itemById(_id)
-            if not i:
-                i = self.inputs.addBoolValueInput(_id, "Remove", False)
-                i.tooltip = "Remove the face from this list"
-            assert self.table.addCommandInput(i, row, 3, 0, 0)
-
     def notify(self, args):
         try:
             self._notify(args)
         except:
-            _ui.messageBox("Error:\n%s" % (traceback.format_exc(),))
+            _ui.messageBox("Error:\n%s" % (traceback.format_exc(),), "Error")
 
     def _notify(self, args):
         args = adsk.core.InputChangedEventArgs.cast(args)
@@ -256,14 +196,14 @@ class ExportsTable(adsk.core.InputChangedEventHandler):
         if args.input.id == self.selectionInputId:
             select = args.input # type: core.SelectionCommandInput
             self._update_selected(select)
+            return
 
-        elif "-" in args.input.id:
-            field, row = args.input.id.rsplit("-", 1)
-
-            if field == "remove":
-                row = int(row)
-                inputs = args.firingEvent.sender.commandInputs
-                face_id = inputs.itemById(_CELL_ID % ('face-id', row)).value
+        inputs = args.firingEvent.sender.commandInputs
+        table = inputs.itemById(_TABLE_ID) # type: core.TableCommandInput
+        found, row, col, r_span, c_span = table.getPosition(args.input)
+        if found:
+            if col == COL.REMOVE:
+                face_id = table.getInputAtPosition(row, COL.FACE_ID).value
                 body_name, temp_id = split_face_id(face_id)
                 self.exports = list(filter(
                     lambda e: e.face_id != face_id, self.exports))
@@ -277,9 +217,9 @@ class ExportsTable(adsk.core.InputChangedEventHandler):
                 for face in selections:
                     if (face.body.name, face.tempId) != (body_name, temp_id):
                         assert select.addSelection(face)
-                self.table.selectedRow = -1
-                t = threading.Thread(target=del_row, args=[inputs, args.input.id])
+                t = threading.Thread(target=del_row, args=[inputs, face_id])
                 t.start()
+                return
 
     def _update_selected(self, select):
         selected = {}
@@ -306,24 +246,92 @@ class ExportsTable(adsk.core.InputChangedEventHandler):
 
         # register all the rest (they're new)
         for face in selected.values():
-            a = face.attributes.itemByName(_ATTR_GROUP, 'basename')
+            a = face.attributes.itemByName(_ATTR_GROUP, 'filename')
             if a:
-                basename = a.value
+                filename = a.value
                 status = FaceExport.SELECTED
             else:
                 basename = face.body.name.replace(os.path.sep, "_")
+                filename, n = basename, 1
+                while any(filename == e.filename for e in self.exports):
+                    n += 1
+                    filename = "%s (%d)" % (basename, n)
                 status = FaceExport.TENTATIVE
-            self.exports.append(FaceExport(face_id(face), basename, status))
+            self.exports.append(FaceExport(face_id(face), filename, status))
 
-        self._render_table()
+        _render_table(self.inputs, self.exports)
 
 
-def del_row(inputs, input_id):
+def _render_table(inputs, exports):
+    table = inputs.itemById(_TABLE_ID) # type: core.TableCommandInput
+    table.clear()
+
+    # header row
+    i = inputs.itemById('th1') \
+        or inputs.addStringValueInput('th1', "", "Include")
+    i.isReadOnly = True
+    assert table.addCommandInput(i, 0, COL.INCLUDE, 0, 0)
+
+    i = inputs.itemById('th2') \
+        or inputs.addStringValueInput('th2', "", "Filename")
+    i.isReadOnly = True
+    assert table.addCommandInput(i, 0, COL.FILENAME, 0, 1)
+
+    # the actual export file list
+    for row, export in enumerate(exports, start=1):
+        # a hidden input
+        _id = _input_id('face-id', export.face_id)
+        i = inputs.itemById(_id)
+        if i:
+            i.value = export.face_id
+        else:
+            i = inputs.addStringValueInput(_id, "", export.face_id)
+            i.isReadOnly = True
+            i.isVisible = False
+        assert table.addCommandInput(i, row, COL.FACE_ID, 0, 0)
+
+        _id = _input_id('include', export.face_id)
+        i = inputs.itemById(_id)
+        if not i:
+            i = inputs.addBoolValueInput(_id, "", True)
+            i.tooltip = "Whether to include the face in this export job"
+        # tentatives are always included
+        i.value = export.status != FaceExport.UNSELECTED
+        if export.status == FaceExport.TENTATIVE:
+            i.isVisible = False
+        else:
+            i.isVisible = True
+        assert table.addCommandInput(i, row, COL.INCLUDE, 0, 0)
+
+        _id = _input_id('filename', export.face_id)
+        i = inputs.itemById(_id)
+        if i:
+            i.value = export.filename
+        else:
+            i = inputs.addStringValueInput(_id, "", export.filename)
+        assert table.addCommandInput(i, row, COL.FILENAME, 0, 0)
+
+        _id = _input_id('ext', export.face_id)
+        i = inputs.itemById(_id)
+        if not i:
+            i = inputs.addStringValueInput(_id, "", ".dxf")
+            i.isReadOnly = True
+        assert table.addCommandInput(i, row, COL.EXT, 0, 0)
+
+        _id = _input_id('remove', export.face_id)
+        i = inputs.itemById(_id)
+        if not i:
+            i = inputs.addBoolValueInput(_id, "Remove", False)
+            i.tooltip = "Remove the face from this list"
+        assert table.addCommandInput(i, row, COL.REMOVE, 0, 0)
+
+
+def del_row(inputs, face_id):
     import time
     time.sleep(.1)
     table = inputs.itemById(_TABLE_ID) # type: core.TableCommandInput
     for row in range(1, table.rowCount):
-        if table.getInputAtPosition(row, 3).id == input_id:
+        if table.getInputAtPosition(row, COL.FACE_ID).value == face_id:
             table.deleteRow(row)
             break
 
@@ -337,14 +345,14 @@ class ExecuteHandler(adsk.core.CommandEventHandler):
         try:
             self._notify(args)
         except:
-            _ui.messageBox("Error:\n%s" % (traceback.format_exc(),))
+            _ui.messageBox("Error:\n%s" % (traceback.format_exc(),), "Error")
 
     def _notify(self, args):
         args = adsk.core.CommandEventArgs.cast(args)
         inputs = args.command.commandInputs
-        table = inputs.itemById(_TABLE_ID)
+        table = inputs.itemById(_TABLE_ID) # type: core.TableCommandInput
 
-        if any(inputs.itemById(_CELL_ID % ('include', row)).value
+        if any(table.getInputAtPosition(row, COL.INCLUDE).valu
                for row in range(1, table.rowCount)):
             d = _ui.createFileDialog()
             d.isMultiSelectEnabled = False
@@ -369,26 +377,39 @@ class ExecuteHandler(adsk.core.CommandEventHandler):
             body = _bodies.item(i)
             bodies[body.name] = body
 
-        for row in range(1, table.rowCount):
-            def input(field):
-                return inputs.itemById(_CELL_ID % (field, row)).value
+        keep = set()
 
-            face_id, basename = map(input, ('face-id', 'basename'))
+        for row in range(1, table.rowCount):
+            face_id = table.getInputAtPosition(row, COL.FACE_ID).value
             body_name, temp_id = split_face_id(face_id)
+            keep.add((body_name, temp_id))
             body = bodies[body_name]
             faces = body.findByTempId(temp_id)
             assert len(faces) == 1, "face tempId collision"
             face = faces[0]
-
+            filename = table.getInputAtPosition(row, COL.FILENAME).value
             # export first, to inhibit permanent export flag on failure
-            if input('include'):
-                filename = input('filename') + input('ext')
-                _ui.messageBox("Generating %s%s%s" % (dir, os.path.sep, filename))
+            if table.getInputAtPosition(row, COL.INCLUDE).value:
+                out = filename + table.getInputAtPosition(row, COL.EXT).value
+                _ui.messageBox("Generating %s%s%s" % (dir, os.path.sep, out))
                 # sketches = rootComp.sketches
                 # sketch = sketches.add()
 
-            face.attributes.add(_ATTR_GROUP, 'basename', basename)
+            face.attributes.add(_ATTR_GROUP, 'filename', filename)
             body.attributes.add(_ATTR_GROUP, 'export', "yes")
+
+        for face in _scan_cache:
+            if (face.body.name, face.tempId) not in keep:
+                a = face.attributes.itemByName(_ATTR_GROUP, 'filename')
+                if a:
+                    a.deleteMe()
+
+            body = face.body
+            if not any(body.faces.item(j).attributes.itemByName(_ATTR_GROUP, 'filename')
+                       for j in range(body.faces.count)):
+                a = body.attributes.itemByName(_ATTR_GROUP, 'export')
+                if a:
+                    a.deleteMe()
 
         adsk.terminate()
 
@@ -423,7 +444,7 @@ def run(context):
 
     except:
         if _ui:
-            _ui.messageBox("Failed:\n%s" % (traceback.format_exc(),))
+            _ui.messageBox("Failed:\n%s" % (traceback.format_exc(),), "Error")
 
 
 def stop(context):
@@ -439,4 +460,4 @@ def stop(context):
 
     except:
         if _ui:
-            _ui.messageBox("Failed:\n%s" % (traceback.format_exc(),))
+            _ui.messageBox("Failed:\n%s" % (traceback.format_exc(),), "Error")
