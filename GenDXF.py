@@ -27,14 +27,8 @@ COL = namedtuple(
     ('FACE_ID', 'INCLUDE', 'FILENAME', 'EXT', 'REMOVE')) \
     (0, 1, 2, 3, 4)
 
-
 # characters that aren't allowed in input IDs
 _non_id = re.compile(r"[^a-zA-Z0-9\-]")
-
-def _input_id(field, face_id):
-    # spaces are allowed, per se, but keepin' it real
-    return _non_id.sub("_", "%s-%s" % (field, face_id)) \
-                  .replace(" ", "-")
 
 
 class FaceExport(object):
@@ -279,21 +273,27 @@ def _render_table(inputs, exports):
 
     # the actual export file list
     for row, export in enumerate(exports, start=1):
+        def mk_id(field):
+            # spaces are allowed, per se, but keepin' it real
+            return _non_id.sub("_", "%s-%s" % (field, export.face_id)) \
+                          .replace(" ", "-")
+
         # a hidden input
-        _id = _input_id('face-id', export.face_id)
-        i = inputs.itemById(_id)
+        id = mk_id('face-id')
+        i = inputs.itemById(id)
         if i:
+            # _just_ in case...
             i.value = export.face_id
         else:
-            i = inputs.addStringValueInput(_id, "", export.face_id)
+            i = inputs.addStringValueInput(id, "", export.face_id)
             i.isReadOnly = True
             i.isVisible = False
         assert table.addCommandInput(i, row, COL.FACE_ID, 0, 0)
 
-        _id = _input_id('include', export.face_id)
-        i = inputs.itemById(_id)
+        id = mk_id('include')
+        i = inputs.itemById(id)
         if not i:
-            i = inputs.addBoolValueInput(_id, "", True)
+            i = inputs.addBoolValueInput(id, "", True)
             i.tooltip = "Whether to include the face in this export job"
         # tentatives are always included
         i.value = export.status != FaceExport.UNSELECTED
@@ -303,25 +303,25 @@ def _render_table(inputs, exports):
             i.isVisible = True
         assert table.addCommandInput(i, row, COL.INCLUDE, 0, 0)
 
-        _id = _input_id('filename', export.face_id)
-        i = inputs.itemById(_id)
+        id = mk_id('filename')
+        i = inputs.itemById(id)
         if i:
             i.value = export.filename
         else:
-            i = inputs.addStringValueInput(_id, "", export.filename)
+            i = inputs.addStringValueInput(id, "", export.filename)
         assert table.addCommandInput(i, row, COL.FILENAME, 0, 0)
 
-        _id = _input_id('ext', export.face_id)
-        i = inputs.itemById(_id)
+        id = mk_id('ext')
+        i = inputs.itemById(id)
         if not i:
-            i = inputs.addStringValueInput(_id, "", ".dxf")
+            i = inputs.addStringValueInput(id, "", ".dxf")
             i.isReadOnly = True
         assert table.addCommandInput(i, row, COL.EXT, 0, 0)
 
-        _id = _input_id('remove', export.face_id)
-        i = inputs.itemById(_id)
+        id = mk_id('remove')
+        i = inputs.itemById(id)
         if not i:
-            i = inputs.addBoolValueInput(_id, "Remove", False)
+            i = inputs.addBoolValueInput(id, "Remove", False)
             i.tooltip = "Remove the face from this list"
         assert table.addCommandInput(i, row, COL.REMOVE, 0, 0)
 
